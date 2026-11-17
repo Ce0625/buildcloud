@@ -1,1 +1,189 @@
 
+name: iOS Unsigned IPA Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_path:
+        description: "Optional: Xcode project/workspace path"
+        required: false
+        default: ""
+      scheme:
+        description: "Optional: Xcode Scheme name"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Show Xcode environment
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install CocoaPods if needed
+        shell: bash
+        run: |
+          if [ -f "Podfile" ]; then
+            if ! command -v pod >/dev/null 2>&1; then
+              brew install cocoapods
+            fi
+            pod install
+          else
+            echo "No Podfile found. Skipping CocoaPods."
+          fi
+
+      - name: Detect Xcode project
+        id: detect
+        shell: bash
+        env:
+          INPUT_PROJECT: ${{ inputs.project_path }}
+          INPUT_SCHEME: ${{ inputs.scheme }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_PROJECT" ]; then
+            TARGET="$INPUT_PROJECT"
+          elif [ -f "Podfile" ] && [ -d "*.xcworkspace" ]; then
+            TARGET=$(find . -maxdepth 2 -name "*.xcworkspace" -print -quit)
+          else
+            TARGET=$(find . -maxdepth 3 \
+              \( -name "*.xcworkspace" -o -name "*.xcodeproj" \) \
+              -print | sort | head -n 1)
+          fi
+
+          if [ -z "${TARGET:-}" ] || [ ! -d "$TARGET" ]; then
+            echo "Xcode project/workspace not found."
+            exit 1
+          fi
+
+          echo "Detected: $TARGET"
+
+          if [[ "$TARGET" == *.xcworkspace ]]; then
+            KIND="workspace"
+            ARG="-workspace"
+          elif [[ "$TARGET" == *.xcodeproj ]]; then
+            KIND="project"
+            ARG="-project"
+          else
+            echo "Unsupported project format."
+            exit 1
+          fi
+
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+
+      - name: Detect Scheme
+        id: scheme
+        shell: bash
+        env:
+          TARGET: ${{ steps.detect.outputs.target }}
+          KIND: ${{ steps.detect.outputs.kind }}
+          INPUT_SCHEME: ${{ inputs.scheme }}
+        run: |
+          set -euo pipefail
+
+          if [ "$KIND" = "workspace" ]; then
+            LIST=$(xcodebuild -list -json -workspace "$TARGET")
+          else
+            LIST=$(xcodebuild -list -json -project "$TARGET")
+          fi
+
+          if [ -n "$INPUT_SCHEME" ]; then
+            SELECTED="$INPUT_SCHEME"
+          else
+            SELECTED=$(echo "$LIST" | python3 -c '
+          import json,sys
+          data=json.load(sys.stdin)
+          key="workspace" if "workspace" in data else "project"
+          schemes=data.get(key,{}).get("schemes",[])
+          if not schemes:
+              sys.exit("No schemes found. Create a shared Xcode scheme.")
+          print(schemes[0])
+          ')
+          fi
+
+          echo "Selected Scheme: $SELECTED"
+          echo "name=$SELECTED" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve dependencies
+        shell: bash
+        env:
+          TARGET: ${{ steps.detect.outputs.target }}
+          KIND: ${{ steps.detect.outputs.kind }}
+        run: |
+          if [ "$KIND" = "workspace" ]; then
+            xcodebuild -resolvePackageDependencies \
+              -workspace "$TARGET"
+          else
+            xcodebuild -resolvePackageDependencies \
+              -project "$TARGET"
+          fi
+
+      - name: Build unsigned iOS app
+        shell: bash
+        env:
+          TARGET: ${{ steps.detect.outputs.target }}
+          KIND: ${{ steps.detect.outputs.kind }}
+          SCHEME: ${{ steps.scheme.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$KIND" = "workspace" ]; then
+            xcodebuild \
+              -workspace "$TARGET" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+              CODE_SIGNING_ALLOWED=NO \
+              build
+          else
+            xcodebuild \
+              -project "$TARGET" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+              CODE_SIGNING_ALLOWED=NO \
+              build
+          fi
+
+      - name: Package unsigned IPA
+        shell: bash
+        env:
+          SCHEME: ${{ steps.scheme.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos" \
+            -maxdepth 1 -name "*.app" -print -quit)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "No iOS app bundle found."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/package/Payload/"
+
+          cd "$RUNNER_TEMP/package"
+          zip -qry "$GITHUB_WORKSPACE/${SCHEME}-unsigned.ipa" Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: "*-unsigned.ipa"
+          if-no-files-found: error
+          retention-days: 7
